@@ -9,7 +9,7 @@ from digitalio import DigitalInOut, Direction, Pull
 # ==================== Hardware Initialization ====================
 
 print("=" * 50)
-print("Apple Slice Game - Starting...")
+print("Fruit Slice Game - Starting...")
 print("=" * 50)
 
 # Initialize I2C bus
@@ -415,7 +415,7 @@ def draw_text(display, text, x, y, color=1, spacing=6):
 
 # ==================== Game Constants ====================
 
-APPLE_SIZE = (8, 8)
+FRUIT_SIZE = (8, 8)
 SCREEN_CENTER = (63, 35)
 INVALID_REGION = {"x_min": 45, "x_max": 81, "y_min": 27, "y_max": 45}
 CUT_TIME_LIMIT = 4.0
@@ -437,16 +437,16 @@ SPEEDS = {
 }
 
 LEVELS = [
-    {"name": "E1:EZ 10A 60S", "speed": "slow", "apples": 10, "time": 60, "difficulty": "easy"},
-    {"name": "E2:EZ 15A 55S", "speed": "slow", "apples": 15, "time": 55, "difficulty": "easy"},
-    {"name": "E3:EZ 20A 50S", "speed": "medium", "apples": 20, "time": 50, "difficulty": "easy"},
-    {"name": "E4:EZ 25A 45S", "speed": "fast", "apples": 25, "time": 45, "difficulty": "easy"},
-    {"name": "M1:MD 20A 45S", "speed": "medium", "apples": 20, "time": 45, "difficulty": "medium"},
-    {"name": "M2:MD 25A 40S", "speed": "fast", "apples": 25, "time": 40, "difficulty": "medium"},
-    {"name": "M3:MD 30A 35S", "speed": "very_fast", "apples": 30, "time": 35, "difficulty": "medium"},
-    {"name": "H1:HD 25A 30S", "speed": "fast", "apples": 25, "time": 30, "difficulty": "hard"},
-    {"name": "H2:HD 30A 25S", "speed": "very_fast", "apples": 30, "time": 25, "difficulty": "hard"},
-    {"name": "H3:HD 35A 20S", "speed": "ultra", "apples": 35, "time": 20, "difficulty": "hard"},
+    {"name": "E1:EZ 10A 60S", "speed": "slow", "fruits": 10, "time": 60, "difficulty": "easy"},
+    {"name": "E2:EZ 15A 55S", "speed": "slow", "fruits": 15, "time": 55, "difficulty": "easy"},
+    {"name": "E3:EZ 20A 50S", "speed": "medium", "fruits": 20, "time": 50, "difficulty": "easy"},
+    {"name": "E4:EZ 25A 45S", "speed": "fast", "fruits": 25, "time": 45, "difficulty": "easy"},
+    {"name": "M1:MD 20A 45S", "speed": "medium", "fruits": 20, "time": 45, "difficulty": "medium"},
+    {"name": "M2:MD 25A 40S", "speed": "fast", "fruits": 25, "time": 40, "difficulty": "medium"},
+    {"name": "M3:MD 30A 35S", "speed": "very_fast", "fruits": 30, "time": 35, "difficulty": "medium"},
+    {"name": "H1:HD 25A 30S", "speed": "fast", "fruits": 25, "time": 30, "difficulty": "hard"},
+    {"name": "H2:HD 30A 25S", "speed": "very_fast", "fruits": 30, "time": 25, "difficulty": "hard"},
+    {"name": "H3:HD 35A 20S", "speed": "ultra", "fruits": 35, "time": 20, "difficulty": "hard"},
 ]
 
 DIFFICULTY_LEVELS = {
@@ -464,7 +464,7 @@ class GameState:
     GAME_OVER = 2
     PAUSED = 3
 
-class Apple:
+class Fruit:
     def __init__(self, spawn_direction, speed, start_time):
         self.spawn_direction = spawn_direction
         self.speed = speed
@@ -503,7 +503,7 @@ class Apple:
         return None
     
     def update(self, current_time):
-        """Update apple position"""
+        """Update fruit position"""
         if self.sliced or self.expired:
             return
         
@@ -522,8 +522,8 @@ class Apple:
             if current_time - self.valid_zone_entry_time > CUT_TIME_LIMIT:
                 self.expired = True
         
-        if (self.x < -APPLE_SIZE[0] or self.x > OLED_WIDTH + APPLE_SIZE[0] or
-            self.y < -APPLE_SIZE[1] or self.y > OLED_HEIGHT + APPLE_SIZE[1]):
+        if (self.x < -FRUIT_SIZE[0] or self.x > OLED_WIDTH + FRUIT_SIZE[0] or
+            self.y < -FRUIT_SIZE[1] or self.y > OLED_HEIGHT + FRUIT_SIZE[1]):
             self.expired = True
     
     def _is_in_invalid_region(self):
@@ -545,11 +545,11 @@ class Game:
         self.current_difficulty_index = 0
         self.current_level_index = 0
         self.current_level = None
-        self.apples = []
+        self.fruits = []
         self.sliced_count = 0
         self.game_start_time = 0
-        self.last_apple_spawn_time = 0
-        self.apple_spawn_interval = 0
+        self.last_fruit_spawn_time = 0
+        self.fruit_spawn_interval = 0
         self.pause_start_time = 0
         self.total_pause_time = 0
         
@@ -596,15 +596,15 @@ class Game:
         
         self.current_level_index = level_index
         self.current_level = LEVELS[level_index]
-        self.apples = []
+        self.fruits = []
         self.sliced_count = 0
         self.game_start_time = time.monotonic()
-        self.last_apple_spawn_time = self.game_start_time
+        self.last_fruit_spawn_time = self.game_start_time
         self.total_pause_time = 0
         
-        total_apples = self.current_level["apples"]
+        total_fruits = self.current_level["apples"]
         total_time = self.current_level["time"]
-        self.apple_spawn_interval = total_time / total_apples if total_apples > 0 else 999
+        self.fruit_spawn_interval = total_time / total_fruits if total_fruits > 0 else 999
         
         self.state = GameState.PLAYING
         self.led_state = "playing"
@@ -614,16 +614,16 @@ class Game:
         
         return True
     
-    def spawn_apple_at_time(self, spawn_time):
-        """Spawn a new apple at specified time"""
+    def spawn_fruit_at_time(self, spawn_time):
+        """Spawn a new fruit at specified time"""
         if not self.current_level:
             return
         
         direction = random.choice(list(SPAWN_POSITIONS.keys()))
         speed = SPEEDS[self.current_level["speed"]]
         
-        apple = Apple(direction, speed, spawn_time)
-        self.apples.append(apple)
+        fruit = Fruit(direction, speed, spawn_time)
+        self.fruits.append(apple)
     
     def update(self):
         """Update game state"""
@@ -781,17 +781,17 @@ class Game:
             self._play_sound("game_over")
             return
         
-        # Spawn apples
-        apples_to_spawn = int(elapsed / self.apple_spawn_interval) + 1
-        apples_to_spawn = min(apples_to_spawn, self.current_level["apples"])
+        # Spawn fruits
+        fruits_to_spawn = int(elapsed / self.fruit_spawn_interval) + 1
+        fruits_to_spawn = min(fruits_to_spawn, self.current_level["apples"])
         
-        while len(self.apples) < apples_to_spawn:
-            spawn_time = self.game_start_time + len(self.apples) * self.apple_spawn_interval
+        while len(self.fruits) < fruits_to_spawn:
+            spawn_time = self.game_start_time + len(self.fruits) * self.fruit_spawn_interval
             self.spawn_apple_at_time(spawn_time)
         
-        # Update all apples
-        for apple in self.apples:
-            apple.update(adjusted_current_time)
+        # Update all fruits
+        for apple in self.fruits:
+            fruit.update(adjusted_current_time)
         
         # Check warning state
         if remaining_time <= 10:
@@ -900,21 +900,21 @@ class Game:
         adjusted_current_time = current_time - self.total_pause_time
         sliced_any = False
         
-        for apple in self.apples:
-            if apple.sliced or apple.expired:
+        for apple in self.fruits:
+            if fruit.sliced or fruit.expired:
                 continue
             
-            if not apple.entered_valid_zone:
+            if not fruit.entered_valid_zone:
                 continue
             
-            if not apple.is_in_valid_zone():
+            if not fruit.is_in_valid_zone():
                 continue
             
-            if apple.expected_action == action:
-                if apple.valid_zone_entry_time is not None:
-                    time_since_entry = adjusted_current_time - apple.valid_zone_entry_time
+            if fruit.expected_action == action:
+                if fruit.valid_zone_entry_time is not None:
+                    time_since_entry = adjusted_current_time - fruit.valid_zone_entry_time
                     if 0 <= time_since_entry <= CUT_TIME_LIMIT:
-                        apple.sliced = True
+                        fruit.sliced = True
                         self.sliced_count += 1
                         sliced_any = True
                         self.led_state = "success"
@@ -1147,8 +1147,8 @@ class Game:
                 draw_text(display, short_name, 2, 2, 1, spacing=5)
                 
                 # Score
-                total_apples = self.current_level["apples"]
-                score_text = f"{self.sliced_count}/{total_apples}"
+                total_fruits = self.current_level["apples"]
+                score_text = f"{self.sliced_count}/{total_fruits}"
                 draw_text(display, score_text, 45, 2, 1, spacing=5)
                 
                 # Countdown
@@ -1166,16 +1166,16 @@ class Game:
                 for i in range(time_dots):
                     display.pixel(OLED_WIDTH - 5 - i, 5, 1)
             
-            # Draw apples (max 10)
-            apple_count = 0
-            for apple in self.apples:
-                if apple_count >= 10:
+            # Draw fruits (max 10)
+            fruit_count = 0
+            for apple in self.fruits:
+                if fruit_count >= 10:
                     break
-                if not apple.sliced and not apple.expired:
-                    x, y = apple.get_pos()
+                if not fruit.sliced and not fruit.expired:
+                    x, y = fruit.get_pos()
                     if 0 <= x < OLED_WIDTH and 0 <= y < OLED_HEIGHT:
-                        display.fill_rect(int(x), int(y), APPLE_SIZE[0], APPLE_SIZE[1], 1)
-                        apple_count += 1
+                        display.fill_rect(int(x), int(y), FRUIT_SIZE[0], FRUIT_SIZE[1], 1)
+                        fruit_count += 1
         except:
             pass
     
@@ -1185,8 +1185,8 @@ class Game:
             draw_text(display, "GAME OVER", 25, 20, 1, spacing=5)
             
             if self.current_level:
-                total_apples = self.current_level["apples"]
-                score_text = f"{self.sliced_count}/{total_apples}"
+                total_fruits = self.current_level["apples"]
+                score_text = f"{self.sliced_count}/{total_fruits}"
                 draw_text(display, score_text, 40, 35, 1, spacing=5)
             
             draw_text(display, "PRESS RESTART", 15, 50, 1, spacing=4)
@@ -1212,8 +1212,8 @@ def main():
     print("[Control Instructions]")
     print("  - Rotary encoder: Select difficulty (Easy/Medium/Hard)")
     print("  - Long press button (1 second): Start game")
-    print("  - Tilt forward/backward: Slice apples from top/bottom")
-    print("  - Rotate encoder (in game): Slice apples from left/right")
+    print("  - Tilt forward/backward: Slice fruits from top/bottom")
+    print("  - Rotate encoder (in game): Slice fruits from left/right")
     print("  - Short press button (in game): Restart")
     print("=" * 50)
     
@@ -1238,7 +1238,7 @@ def main():
             if current_time - last_debug_time > 5.0:
                 print(f"[Status] Game state: {game.state}, "
                       f"Difficulty: {DIFFICULTY_NAMES[game.current_difficulty_index] if game.current_difficulty_index < len(DIFFICULTY_NAMES) else 'N/A'}, "
-                      f"Apples sliced: {game.sliced_count}")
+                      f"Fruits sliced: {game.sliced_count}")
                 last_debug_time = current_time
             
             # Update game state
