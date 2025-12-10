@@ -38,6 +38,7 @@ class RawOLEDDisplay:
         self.height = height
         self.address = address
         self.buffer = bytearray(width * height // 8)
+        self._oled_should_be_off = False
         self._init_display()
     
     def _send_command(self, cmd):
@@ -128,16 +129,71 @@ class RawOLEDDisplay:
             pass
 
 # Create OLED display object
+display_ok = False
 if I2C_BUS:
     try:
         display = RawOLEDDisplay(I2C_BUS, OLED_WIDTH, OLED_HEIGHT, 0x3C)
+        display_ok = True
         print("✓ OLED display initialized successfully")
     except:
         print("✗ OLED initialization failed")
         display = None
+        display_ok = False
 else:
     print("✗ I2C bus unavailable, OLED disabled")
     display = None
+    display_ok = False
+
+# -------------------- Accelerometer Calibration & Filter Class --------------------
+class CalibratedAccel:
+    """Accelerometer wrapper with static calibration and first-order low-pass filter"""
+    def __init__(self, accel):
+        self.accel = accel
+        # Static calibration: calculate offset from 100 stationary samples
+        self.x_offset, self.y_offset, self.z_offset = self.calibrate()
+        # Low-pass filter parameters (alpha=0.2, adjustable smooth factor)
+        self.alpha = 0.2
+        self.filtered_x, self.filtered_y, self.filtered_z = 0.0, 0.0, 0.0
+
+    def calibrate(self, samples=100):
+        """Static calibration: calculate average offset from multiple stationary readings"""
+        x_sum, y_sum, z_sum = 0.0, 0.0, 0.0
+        print("Calibrating accelerometer (keep still)...")
+        for _ in range(samples):
+            try:
+                x, y, z = self.accel.acceleration
+                x_sum += x
+                y_sum += y
+                z_sum += z
+                time.sleep(0.01)
+            except:
+                pass
+        # Calculate average offset (x/y ≈ 0, z ≈ 9.81 when stationary)
+        x_offset = x_sum / samples if samples > 0 else 0.0
+        y_offset = y_sum / samples if samples > 0 else 0.0
+        z_offset = (z_sum / samples) - 9.81 if samples > 0 else 0.0
+        print(f"✓ Accelerometer calibration done - offsets: x={x_offset:.2f}, y={y_offset:.2f}, z={z_offset:.2f}")
+        return x_offset, y_offset, z_offset
+
+    @property
+    def acceleration(self):
+        """Calibrated and filtered acceleration readings (compatible with original interface)"""
+        try:
+            # Read raw values
+            raw_x, raw_y, raw_z = self.accel.acceleration
+            # Step 1: Calibration (remove zero offset)
+            cal_x = raw_x - self.x_offset
+            cal_y = raw_y - self.y_offset
+            cal_z = raw_z - self.z_offset
+            # Step 2: First-order low-pass filter (remove high-frequency noise)
+            self.filtered_x = self.alpha * cal_x + (1 - self.alpha) * self.filtered_x
+            self.filtered_y = self.alpha * cal_y + (1 - self.alpha) * self.filtered_y
+            self.filtered_z = self.alpha * cal_z + (1 - self.alpha) * self.filtered_z
+            # Step 3: Outlier filtering (limit range to avoid jumps)
+            clamp = lambda v: max(min(v, 20.0), -20.0)
+            return clamp(self.filtered_x), clamp(self.filtered_y), clamp(self.filtered_z)
+        except:
+            return 0.0, 0.0, 0.0
 
 # ADXL345 accelerometer initialization
 print("\nInitializing ADXL345 accelerometer...")
@@ -146,7 +202,8 @@ if I2C_BUS:
     try:
         # Import from lib (verified to work)
         import lib.adafruit_adxl34x as adafruit_adxl34x
-        accelerometer = adafruit_adxl34x.ADXL345(I2C_BUS)
+        raw_accel = adafruit_adxl34x.ADXL345(I2C_BUS)
+        accelerometer = CalibratedAccel(raw_accel)
         print("✓ ADXL345 accelerometer initialized successfully")
     except Exception as e:
         print(f"✗ ADXL345 initialization failed: {e}")
@@ -167,7 +224,31 @@ try:
     print("✓ NeoPixel LED initialized successfully")
 except Exception as e:
     print(f"✗ NeoPixel initialization failed: {e}")
-    pixels = None
+    # Dummy class for compatibility
+    class DummyPixels:
+        def __setitem__(self, key, value): pass
+        @property
+        def brightness(self): return 0.5
+        @brightness.setter
+        def brightness(self, value): pass
+    pixels = DummyPixels()
+
+# -------------------- Debounce Utility Function --------------------
+def read_pin_stable(pin, samples=5, delay=0.005):
+    """Debounced pin reading function"""
+    if not pin:
+        return False
+    values = []
+    for _ in range(samples):
+        try:
+            values.append(pin.value)
+            time.sleep(delay)
+        except:
+            pass
+    if not values:
+        return pin.value
+    # Return the most frequent stable value
+    return max(set(values), key=values.count)
 
 # Rotary encoder initialization (using debugged manual method)
 print("\nInitializing rotary encoder...")
@@ -195,8 +276,9 @@ try:
             if not self.clk or not self.dt:
                 return self._position
             
-            clk_val = self.clk.value
-            dt_val = self.dt.value
+            # Debounced pin reading
+            clk_val = read_pin_stable(self.clk)
+            dt_val = read_pin_stable(self.dt)
             
             # Detect CLK falling edge
             if self._last_clk is not None and self._last_dt is not None:
@@ -244,11 +326,13 @@ except Exception as e:
 
 # Buzzer initialization (active buzzer, inverted logic)
 print("\nInitializing buzzer...")
+buzzer_available = False
+buzzer_is_active = True
+BUZZER_INVERTED_LOGIC = True
 try:
     buzzer = DigitalInOut(board.D6)
     buzzer.direction = Direction.OUTPUT
     buzzer.value = True  # Initial state: off (inverted logic)
-    BUZZER_INVERTED_LOGIC = True
     buzzer_available = True
     print("✓ Buzzer initialized successfully (active, inverted logic)")
 except Exception as e:
@@ -258,6 +342,7 @@ except Exception as e:
 
 # Power switch initialization
 print("\nInitializing power switch monitoring...")
+power_switch = None
 try:
     power_switch = DigitalInOut(board.D0)
     power_switch.direction = Direction.INPUT
@@ -333,7 +418,8 @@ def draw_text(display, text, x, y, color=1, spacing=6):
 APPLE_SIZE = (8, 8)
 SCREEN_CENTER = (63, 35)
 INVALID_REGION = {"x_min": 45, "x_max": 81, "y_min": 27, "y_max": 45}
-CUT_TIME_LIMIT = 2.0
+CUT_TIME_LIMIT = 4.0
+RESPONSE_DELAY = 0.2
 
 SPAWN_POSITIONS = {
     "top": (63, 0),
@@ -351,7 +437,7 @@ SPEEDS = {
 }
 
 LEVELS = [
-    {"name": "E1:EZ 12A 60S", "speed": "slow", "apples": 12, "time": 60, "difficulty": "easy"},
+    {"name": "E1:EZ 10A 60S", "speed": "slow", "apples": 10, "time": 60, "difficulty": "easy"},
     {"name": "E2:EZ 15A 55S", "speed": "slow", "apples": 15, "time": 55, "difficulty": "easy"},
     {"name": "E3:EZ 20A 50S", "speed": "medium", "apples": 20, "time": 50, "difficulty": "easy"},
     {"name": "E4:EZ 25A 45S", "speed": "fast", "apples": 25, "time": 45, "difficulty": "easy"},
@@ -372,11 +458,11 @@ DIFFICULTY_LEVELS = {
 DIFFICULTY_NAMES = ["EASY", "MEDIUM", "HARD"]
 
 # ==================== Game Classes ====================
-
 class GameState:
     MENU = 0
     PLAYING = 1
     GAME_OVER = 2
+    PAUSED = 3
 
 class Apple:
     def __init__(self, spawn_direction, speed, start_time):
@@ -427,18 +513,15 @@ class Apple:
         self.x = self.start_pos[0] + self.direction[0] * distance
         self.y = self.start_pos[1] + self.direction[1] * distance
         
-        # Check if entered valid zone
         if not self.entered_valid_zone:
             if not self._is_in_invalid_region():
                 self.entered_valid_zone = True
                 self.valid_zone_entry_time = current_time
         
-        # Check if expired
         if self.entered_valid_zone:
             if current_time - self.valid_zone_entry_time > CUT_TIME_LIMIT:
                 self.expired = True
         
-        # Check if out of screen
         if (self.x < -APPLE_SIZE[0] or self.x > OLED_WIDTH + APPLE_SIZE[0] or
             self.y < -APPLE_SIZE[1] or self.y > OLED_HEIGHT + APPLE_SIZE[1]):
             self.expired = True
@@ -467,11 +550,26 @@ class Game:
         self.game_start_time = 0
         self.last_apple_spawn_time = 0
         self.apple_spawn_interval = 0
+        self.pause_start_time = 0
+        self.total_pause_time = 0
         
         # Input state
-        self.last_encoder_position = encoder.position if ENCODER_AVAILABLE else 0
+        try:
+            if ENCODER_AVAILABLE:
+                self.last_encoder_position = encoder.position
+                encoder.position = 0
+                self.last_encoder_position = 0
+            else:
+                self.last_encoder_position = 0
+        except:
+            self.last_encoder_position = 0
+        
+        self._update_level_index_from_difficulty()
+        self.last_encoder_action_time = 0
         self.last_accel_y = 0.0
         self.last_accel_action_time = 0
+        self.encoder_action_pending = None
+        self.accel_action_pending = None
         
         # LED state
         self.led_state = "idle"
@@ -483,6 +581,13 @@ class Game:
         self._button_last_state = False
         self._button_press_start_time = 0
         self._button_action_done = False
+        
+        # Power switch state - initialize carefully
+        try:
+            self.last_power_switch_state = power_switch.value if power_switch else False
+            print(f"[DEBUG] Initial power switch state: {self.last_power_switch_state}")
+        except:
+            self.last_power_switch_state = False
     
     def start_level(self, level_index):
         """Start specified level"""
@@ -495,6 +600,7 @@ class Game:
         self.sliced_count = 0
         self.game_start_time = time.monotonic()
         self.last_apple_spawn_time = self.game_start_time
+        self.total_pause_time = 0
         
         total_apples = self.current_level["apples"]
         total_time = self.current_level["time"]
@@ -509,7 +615,7 @@ class Game:
         return True
     
     def spawn_apple_at_time(self, spawn_time):
-        """Spawn new apple at specified time"""
+        """Spawn a new apple at specified time"""
         if not self.current_level:
             return
         
@@ -521,21 +627,95 @@ class Game:
     
     def update(self):
         """Update game state"""
-        current_time = time.monotonic()
+        try:
+            current_time = time.monotonic()
+        except:
+            return
         
-        # Update game state
-        if self.state == GameState.MENU:
-            self._update_menu()
-        elif self.state == GameState.PLAYING:
-            self._update_playing(current_time)
-        elif self.state == GameState.GAME_OVER:
-            self._update_game_over()
+        # Monitor power switch (safe operation)
+        try:
+            self._monitor_power_switch(current_time)
+        except:
+            pass
         
-        # Update LEDs
-        self._update_leds(current_time)
+        # Update game state based on current state
+        try:
+            if self.state == GameState.MENU:
+                self._update_menu()
+            elif self.state == GameState.PLAYING:
+                self._update_playing(current_time)
+            elif self.state == GameState.GAME_OVER:
+                self._update_game_over()
+            elif self.state == GameState.PAUSED:
+                self._update_paused()
+        except Exception as e:
+            pass
         
-        # Update inputs
-        self._update_inputs(current_time)
+        # Update LEDs (safe operation)
+        try:
+            self._update_leds(current_time)
+        except:
+            pass
+        
+        # Update inputs (safe operation)
+        try:
+            self._update_inputs(current_time)
+        except:
+            pass
+    
+    def _monitor_power_switch(self, current_time):
+        """Monitor power switch state and control OLED"""
+        if not power_switch:
+            return
+        
+        try:
+            # Debounced power switch reading
+            switch_state = read_pin_stable(power_switch)
+            
+            # Debug output every 2 seconds
+            if not hasattr(self, '_last_switch_debug_time'):
+                self._last_switch_debug_time = 0
+            
+            if current_time - self._last_switch_debug_time > 2.0:
+                print(f"[DEBUG] Switch state: {switch_state} (last: {self.last_power_switch_state})")
+                self._last_switch_debug_time = current_time
+            
+            # Detect state changes
+            if switch_state != self.last_power_switch_state:
+                print(f"[POWER] *** STATE CHANGE DETECTED ***")
+                print(f"[POWER] Old state: {self.last_power_switch_state}, New state: {switch_state}")
+                
+                if switch_state:
+                    # Switch turned OFF (HIGH)
+                    print("[POWER] Switch turned OFF")
+                    if display_ok and display:
+                        display._oled_should_be_off = True
+                        # Send display OFF command
+                        try:
+                            if hasattr(display, '_send_command'):
+                                display._send_command(0xAE)
+                                print("[POWER] Display OFF command sent")
+                        except Exception as e:
+                            print(f"[POWER] Display OFF error: {e}")
+                else:
+                    # Switch turned ON (LOW)
+                    print("[POWER] Switch turned ON - Enabling display")
+                    if display_ok and display:
+                        display._oled_should_be_off = False
+                        # Send display ON command and clear screen
+                        try:
+                            if hasattr(display, '_send_command'):
+                                display._send_command(0xAF)
+                                time.sleep(0.05)
+                                display.fill(0)
+                                display.show()
+                                print("[POWER] Display reinitialized and cleared")
+                        except Exception as e:
+                            print(f"[POWER] Display ON error: {e}")
+                
+                self.last_power_switch_state = switch_state
+        except Exception as e:
+            print(f"[POWER] Monitor error: {e}")
     
     def _update_menu(self):
         """Update menu state - select difficulty"""
@@ -547,70 +727,58 @@ class Game:
                 encoder_pos = encoder.position
                 if encoder_pos != self.last_encoder_position:
                     diff = encoder_pos - self.last_encoder_position
-                    if diff != 0:
+                    if abs(diff) <= 100:
                         if diff > 0:
                             self.current_difficulty_index = (self.current_difficulty_index + 1) % len(DIFFICULTY_NAMES)
                             self._play_sound("menu_move")
                         elif diff < 0:
                             self.current_difficulty_index = (self.current_difficulty_index - 1) % len(DIFFICULTY_NAMES)
                             self._play_sound("menu_move")
-                        
-                        # Update level index
-                        if self.current_difficulty_index < len(DIFFICULTY_NAMES):
-                            difficulty_name = DIFFICULTY_NAMES[self.current_difficulty_index].lower()
-                            if difficulty_name in DIFFICULTY_LEVELS:
-                                self.current_level_index = DIFFICULTY_LEVELS[difficulty_name]
-                        
-                        print(f"[MENU] Selected difficulty: {DIFFICULTY_NAMES[self.current_difficulty_index]}")
-                    
+                        self._update_level_index_from_difficulty()
                     self.last_encoder_position = encoder_pos
-            except Exception as e:
-                print(f"[MENU] Encoder error: {e}")
+            except:
+                pass
         
         # Check button press - long press to start game
-        if encoder_button:
-            button_current = encoder_button.value
+        button_current = read_pin_stable(encoder_button)
+        
+        if button_current and not self._button_last_state:
+            self._button_press_start_time = current_time
+            self._button_action_done = False
+        
+        if button_current and self._button_press_start_time > 0:
+            hold_time = current_time - self._button_press_start_time
             
-            if button_current and not self._button_last_state:
-                self._button_press_start_time = current_time
-                self._button_action_done = False
-            
-            if button_current and self._button_press_start_time > 0:
-                hold_time = current_time - self._button_press_start_time
-                
-                # Show long press progress
-                if hold_time > 0.5 and hold_time < 1.0 and not self._button_action_done:
-                    print(f"[MENU] Button being held: {hold_time:.1f}s")
-                
-                if not self._button_action_done and hold_time >= 1.0:
-                    print("[MENU] Long button press detected - starting game!")
+            if not self._button_action_done:
+                if hold_time >= 1.0:
                     if self.state == GameState.MENU and self.current_level is None:
                         self.start_level(self.current_level_index)
-                        self._play_sound("start")
                     self._button_action_done = True
-            
-            # Short press function
-            if not button_current and self._button_last_state:
-                hold_time = current_time - self._button_press_start_time if self._button_press_start_time > 0 else 0
-                
-                if hold_time < 1.0 and not self._button_action_done:
-                    print("[MENU] Short button press")
-                
-                self._button_action_done = False
-                self._button_press_start_time = 0
-            
-            self._button_last_state = button_current
+        
+        if not button_current and self._button_last_state:
+            self._button_action_done = False
+            self._button_press_start_time = 0
+        
+        self._button_last_state = button_current
+    
+    def _update_level_index_from_difficulty(self):
+        """Update level index based on current difficulty index"""
+        if self.current_difficulty_index < len(DIFFICULTY_NAMES):
+            difficulty_name = DIFFICULTY_NAMES[self.current_difficulty_index].lower()
+            if difficulty_name in DIFFICULTY_LEVELS:
+                self.current_level_index = DIFFICULTY_LEVELS[difficulty_name]
     
     def _update_playing(self, current_time):
-        """Update game playing state"""
-        elapsed = current_time - self.game_start_time
+        """Update playing state"""
+        # Adjust time for pauses
+        adjusted_current_time = current_time - self.total_pause_time
+        elapsed = adjusted_current_time - self.game_start_time
         remaining_time = self.current_level["time"] - elapsed
         
         if remaining_time <= 0:
             self.state = GameState.GAME_OVER
             self.led_state = "game_over"
             self._play_sound("game_over")
-            print(f"[GAME] Game over! Score: {self.sliced_count}/{self.current_level['apples']}")
             return
         
         # Spawn apples
@@ -622,10 +790,8 @@ class Game:
             self.spawn_apple_at_time(spawn_time)
         
         # Update all apples
-        for apple in self.apples[:]:
-            apple.update(current_time)
-            if apple.expired:
-                self.apples.remove(apple)
+        for apple in self.apples:
+            apple.update(adjusted_current_time)
         
         # Check warning state
         if remaining_time <= 10:
@@ -635,164 +801,210 @@ class Game:
         """Update game over state"""
         current_time = time.monotonic()
         
-        if encoder_button:
-            button_current = encoder_button.value
-            
-            if not hasattr(self, '_game_over_button_last_state'):
-                self._game_over_button_last_state = False
-            if not hasattr(self, '_game_over_button_press_time'):
+        button_current = read_pin_stable(encoder_button)
+        
+        if not hasattr(self, '_game_over_button_last_state'):
+            self._game_over_button_last_state = False
+        if not hasattr(self, '_game_over_button_press_time'):
+            self._game_over_button_press_time = 0
+        
+        if button_current and not self._game_over_button_last_state:
+            self._game_over_button_press_time = current_time
+        
+        if button_current and self._game_over_button_press_time > 0:
+            if current_time - self._game_over_button_press_time > 0.2:
+                self.state = GameState.MENU
+                self.current_level = None
+                self.current_difficulty_index = 0
+                self._update_level_index_from_difficulty()
+                self.led_state = "idle"
                 self._game_over_button_press_time = 0
-            
-            if button_current and not self._game_over_button_last_state:
-                self._game_over_button_press_time = current_time
-            
-            if button_current and self._game_over_button_press_time > 0:
-                if current_time - self._game_over_button_press_time > 0.5:
-                    self.state = GameState.MENU
-                    self.current_level = None
-                    self.current_difficulty_index = 0
-                    self.led_state = "idle"
-                    self._game_over_button_press_time = 0
-                    self._play_sound("menu_select")
-                    print("[GAME] Returning to menu")
-            
-            if not button_current and self._game_over_button_last_state:
-                self._game_over_button_press_time = 0
-            
-            self._game_over_button_last_state = button_current
+                self._play_sound("menu_select")
+        
+        if not button_current and self._game_over_button_last_state:
+            self._game_over_button_press_time = 0
+        
+        self._game_over_button_last_state = button_current
+    
+    def _update_paused(self):
+        """Update paused state"""
+        # Game is paused - wait for resume
+        pass
     
     def _update_inputs(self, current_time):
-        """Update input handling"""
-        # Only process cutting inputs during gameplay
-        if self.state != GameState.PLAYING:
-            return
-        
-        # 1. Encoder input (rotate to slice fruits)
-        if ENCODER_AVAILABLE:
+        """Update input processing"""
+        # Encoder input (only in playing state)
+        if self.state == GameState.PLAYING and ENCODER_AVAILABLE:
             try:
                 encoder_pos = encoder.position
-                if encoder_pos != self.last_encoder_position:
-                    diff = encoder_pos - self.last_encoder_position
-                    
-                    if diff != 0:
-                        if diff > 0:
-                            action = "rotate_right"
-                        else:
-                            action = "rotate_left"
-                        
-                        print(f"[INPUT] Encoder rotated: {action}")
-                        self._check_cut_action(action)
-                        
-                        self.last_encoder_position = encoder_pos
-            except Exception as e:
-                print(f"[INPUT] Encoder error: {e}")
+            except:
+                encoder_pos = self.last_encoder_position
+            
+            if encoder_pos != self.last_encoder_position:
+                diff = encoder_pos - self.last_encoder_position
+                if abs(diff) <= 100 and diff != 0:
+                    if diff > 0:
+                        self.encoder_action_pending = ("rotate_right", current_time + RESPONSE_DELAY)
+                    else:
+                        self.encoder_action_pending = ("rotate_left", current_time + RESPONSE_DELAY)
+                    self.last_encoder_position = encoder_pos
         
-        # 2. Accelerometer input (tilt to slice fruits)
-        if current_time - self.last_accel_action_time > 0.1:  # 100ms detection interval
+        # Check pending encoder action
+        if self.encoder_action_pending:
+            action, action_time = self.encoder_action_pending
+            if current_time >= action_time:
+                if self.state == GameState.PLAYING:
+                    try:
+                        self._check_cut_action(action)
+                    except:
+                        pass
+                self.encoder_action_pending = None
+        
+        # Accelerometer input (skip if power switch is OFF to avoid I2C issues)
+        if power_switch:
+            try:
+                if power_switch.value:  # HIGH = Switch OFF
+                    return  # Skip accelerometer when switch is OFF
+            except:
+                pass
+        
+        if current_time - self.last_accel_action_time > 0.1:
             try:
                 x, y, z = accelerometer.acceleration
+                accel_threshold = 2.0
                 
-                # Adjust threshold
-                accel_threshold = 5.0
-                
-                # Tilt forward (device top down)
-                if y < -accel_threshold and self.last_accel_y >= -accel_threshold:
-                    print(f"[INPUT] Forward tilt detected: Y={y:.2f}")
-                    self._check_cut_action("forward")
-                
-                # Tilt backward (device top up)
-                elif y > accel_threshold and self.last_accel_y <= accel_threshold:
-                    print(f"[INPUT] Backward tilt detected: Y={y:.2f}")
-                    self._check_cut_action("backward")
+                if y > accel_threshold and self.last_accel_y <= accel_threshold:
+                    self.accel_action_pending = ("forward", current_time + RESPONSE_DELAY)
+                elif y < -accel_threshold and self.last_accel_y >= -accel_threshold:
+                    self.accel_action_pending = ("backward", current_time + RESPONSE_DELAY)
                 
                 self.last_accel_y = y
                 self.last_accel_action_time = current_time
             except:
                 pass
+        
+        # Check pending accelerometer action
+        if self.accel_action_pending:
+            action, action_time = self.accel_action_pending
+            if current_time >= action_time:
+                if self.state == GameState.PLAYING:
+                    try:
+                        self._check_cut_action(action)
+                    except:
+                        pass
+                self.accel_action_pending = None
     
     def _check_cut_action(self, action):
-        """Check cutting action"""
-        if not self.current_level:
-            return
-        
+        """Check cut action"""
         current_time = time.monotonic()
+        adjusted_current_time = current_time - self.total_pause_time
         sliced_any = False
         
-        print(f"[CUT] Checking action: {action}")
-        print(f"[CUT] Total apples: {len(self.apples)}")
-        
-        for apple in self.apples[:]:
+        for apple in self.apples:
             if apple.sliced or apple.expired:
                 continue
             
-            # Apple must enter valid zone to be sliced
             if not apple.entered_valid_zone:
                 continue
             
-            # Apple must be in valid zone
             if not apple.is_in_valid_zone():
                 continue
             
-            # Action must match expected action
-            if apple.expected_action != action:
-                print(f"[CUT] Action mismatch: Expected {apple.expected_action}, Actual {action}")
-                continue
-            
-            # Check if within cutting time window
-            if apple.valid_zone_entry_time is not None:
-                time_since_entry = current_time - apple.valid_zone_entry_time
-                print(f"[CUT] Time since entry: {time_since_entry:.2f}s")
-                
-                if 0 <= time_since_entry <= CUT_TIME_LIMIT:
-                    apple.sliced = True
-                    self.sliced_count += 1
-                    sliced_any = True
-                    self.led_state = "success"
-                    self.last_led_update = current_time
-                    self._play_sound("success")
-                    print(f"[CUT] ✓ Success! Apple sliced! Total: {self.sliced_count}")
-                    break  # Only slice one apple at a time
+            if apple.expected_action == action:
+                if apple.valid_zone_entry_time is not None:
+                    time_since_entry = adjusted_current_time - apple.valid_zone_entry_time
+                    if 0 <= time_since_entry <= CUT_TIME_LIMIT:
+                        apple.sliced = True
+                        self.sliced_count += 1
+                        sliced_any = True
+                        self.led_state = "success"
+                        self.last_led_update = current_time
+                        self._play_sound("success")
+                        break
         
         if not sliced_any and self.state == GameState.PLAYING:
-            print(f"[CUT] ✗ Failed! No matching apple for: {action}")
             self.led_state = "error"
             self.last_led_update = current_time
             self._play_sound("error")
     
     def _play_sound(self, sound_type):
-        """Play sound effects"""
+        """Play sound effect"""
+        if not buzzer_available or not buzzer:
+            return
+        
+        # Don't play sounds during hardware initialization
+        if not hasattr(self, 'game_start_time'):
+            return
+        
+        try:
+            if buzzer_is_active:
+                # Active buzzer - simple ON/OFF (non-blocking)
+                if sound_type == "success":
+                    if BUZZER_INVERTED_LOGIC:
+                        buzzer.value = False
+                    else:
+                        buzzer.value = True
+                elif sound_type == "error":
+                    if BUZZER_INVERTED_LOGIC:
+                        buzzer.value = False
+                    else:
+                        buzzer.value = True
+                elif sound_type in ["start", "menu_select"]:
+                    if BUZZER_INVERTED_LOGIC:
+                        buzzer.value = False
+                    else:
+                        buzzer.value = True
+                elif sound_type == "menu_move":
+                    # Skip menu move sound to avoid blocking
+                    pass
+                elif sound_type == "game_over":
+                    if BUZZER_INVERTED_LOGIC:
+                        buzzer.value = False
+                    else:
+                        buzzer.value = True
+            else:
+                # Passive buzzer - PWM tones (non-blocking)
+                if sound_type == "success":
+                    buzzer.frequency = 2000
+                    buzzer.duty_cycle = 32768
+                elif sound_type == "error":
+                    buzzer.frequency = 500
+                    buzzer.duty_cycle = 32768
+                elif sound_type in ["start", "game_over", "menu_select"]:
+                    buzzer.frequency = 1500
+                    buzzer.duty_cycle = 32768
+                elif sound_type == "menu_move":
+                    # Skip menu move sound
+                    pass
+        except:
+            pass
+    
+    def _stop_sound(self):
+        """Stop buzzer sound"""
         if not buzzer_available or not buzzer:
             return
         
         try:
-            if sound_type == "success":
-                buzzer.value = False if BUZZER_INVERTED_LOGIC else True
-                time.sleep(0.1)
-                buzzer.value = True if BUZZER_INVERTED_LOGIC else False
-            elif sound_type == "error":
-                buzzer.value = False if BUZZER_INVERTED_LOGIC else True
-                time.sleep(0.3)
-                buzzer.value = True if BUZZER_INVERTED_LOGIC else False
-            elif sound_type in ["start", "game_over", "menu_select"]:
-                buzzer.value = False if BUZZER_INVERTED_LOGIC else True
-                time.sleep(0.2)
-                buzzer.value = True if BUZZER_INVERTED_LOGIC else False
-            elif sound_type == "menu_move":
-                buzzer.value = False if BUZZER_INVERTED_LOGIC else True
-                time.sleep(0.05)
-                buzzer.value = True if BUZZER_INVERTED_LOGIC else False
+            if buzzer_is_active:
+                if BUZZER_INVERTED_LOGIC:
+                    buzzer.value = True
+                else:
+                    buzzer.value = False
+            else:
+                buzzer.duty_cycle = 0
         except:
             pass
     
     def _update_leds(self, current_time):
         """Update LED state"""
-        if not pixels:
-            return
-        
         try:
             if self.led_state == "idle" or self.led_state == "game_over":
-                # Breathing blue light
-                self.led_brightness += 0.01 * self.led_brightness_dir
+                # Slow breathing blue
+                if not hasattr(self, '_last_led_brightness_update'):
+                    self._last_led_brightness_update = current_time
+                
+                # Update brightness every frame
+                self.led_brightness += 0.005 * self.led_brightness_dir
                 if self.led_brightness >= 0.5:
                     self.led_brightness = 0.5
                     self.led_brightness_dir = -1
@@ -802,36 +1014,41 @@ class Game:
                 
                 pixels.brightness = self.led_brightness
                 pixels[0] = (0, 0, 255)
+                self._last_led_brightness_update = current_time
+                self._stop_sound()
             
             elif self.led_state == "playing":
-                # Steady green light
+                # Solid green
                 pixels.brightness = 0.3
                 pixels[0] = (0, 255, 0)
+                self._stop_sound()
             
             elif self.led_state == "success":
-                # Fast blue flash
+                # Quick blue flash
                 if current_time - self.last_led_update < 0.2:
                     pixels.brightness = 0.5
                     pixels[0] = (0, 0, 255)
                 else:
                     pixels.brightness = 0.3
                     pixels[0] = (0, 255, 0)
+                    self._stop_sound()
                     if current_time - self.last_led_update > 0.3:
                         self.led_state = "playing"
             
             elif self.led_state == "error":
-                # Fast red flash
+                # Quick red flash
                 if current_time - self.last_led_update < 0.2:
                     pixels.brightness = 0.5
                     pixels[0] = (255, 0, 0)
                 else:
                     pixels.brightness = 0.3
                     pixels[0] = (0, 255, 0)
+                    self._stop_sound()
                     if current_time - self.last_led_update > 0.3:
                         self.led_state = "playing"
             
             elif self.led_state == "warning":
-                # Flashing yellow/orange
+                # Blink yellow/orange
                 blink = int(current_time * 3) % 2
                 pixels.brightness = 0.4
                 if blink:
@@ -843,22 +1060,46 @@ class Game:
     
     def draw(self):
         """Draw game screen"""
-        if not display:
+        if not display_ok or not display:
             return
+        
+        # Check if OLED should be off FIRST (before any display operations)
+        if power_switch:
+            try:
+                current_switch_state = read_pin_stable(power_switch)
+                if current_switch_state:  # HIGH = Switch OFF
+                    return  # Don't touch display at all
+            except:
+                pass
+        
+        oled_should_be_off = getattr(display, '_oled_should_be_off', False)
+        if oled_should_be_off:
+            return  # Don't touch display at all
         
         try:
             display.fill(0)
             
+            if self.current_level is None:
+                self.state = GameState.MENU
+            
             if self.state == GameState.MENU:
                 self._draw_menu()
             elif self.state == GameState.PLAYING:
-                self._draw_playing()
+                if self.current_level is not None:
+                    self._draw_playing()
+                else:
+                    self.state = GameState.MENU
+                    self._draw_menu()
             elif self.state == GameState.GAME_OVER:
                 self._draw_game_over()
+            else:
+                self.state = GameState.MENU
+                self.current_level = None
+                self._draw_menu()
             
             display.show()
-        except Exception as e:
-            print(f"[DRAW] Drawing error: {e}")
+        except:
+            pass
     
     def _draw_menu(self):
         """Draw menu - show difficulty selection"""
@@ -869,7 +1110,7 @@ class Game:
                 # Draw difficulty name
                 draw_text(display, difficulty_name, 40, 10, 1, spacing=6)
                 
-                # Draw difficulty selection indicator
+                # Draw difficulty selection indicators
                 bar_y = 25
                 bar_height = 8
                 bar_width = 25
@@ -888,13 +1129,13 @@ class Game:
                     level_info = level["name"]
                     draw_text(display, level_info, 10, 40, 1, spacing=5)
                 
-                # Draw prompt
+                # Draw hint
                 draw_text(display, "PRESS START", 20, 55, 1, spacing=6)
         except:
             pass
     
     def _draw_playing(self):
-        """Draw game screen"""
+        """Draw playing screen"""
         try:
             if self.current_level:
                 # Draw status bar
@@ -912,14 +1153,20 @@ class Game:
                 
                 # Countdown
                 current_time = time.monotonic()
-                elapsed = current_time - self.game_start_time
+                adjusted_current_time = current_time - self.total_pause_time
+                elapsed = adjusted_current_time - self.game_start_time
                 remaining = max(0, self.current_level["time"] - elapsed)
                 minutes = int(remaining // 60)
                 seconds = int(remaining % 60)
                 time_text = f"{minutes}:{seconds:02d}"
                 draw_text(display, time_text, 85, 2, 1, spacing=5)
+                
+                # Time indicator dots
+                time_dots = min(int(remaining / 5), 20)
+                for i in range(time_dots):
+                    display.pixel(OLED_WIDTH - 5 - i, 5, 1)
             
-            # Draw apples (max 10 displayed)
+            # Draw apples (max 10)
             apple_count = 0
             for apple in self.apples:
                 if apple_count >= 10:
@@ -952,6 +1199,16 @@ def main():
     print("\n" + "=" * 50)
     print("Game started - entering main loop")
     print("=" * 50)
+    # Show welcome screen
+    if display:
+        try:
+            display.fill(0)
+            draw_text(display, "WELCOME", 25, 25, 1, spacing=6)
+            display.show()
+            time.sleep(2)
+        except Exception as e:
+            print(f"Welcome screen display error: {e}")
+    
     print("[Control Instructions]")
     print("  - Rotary encoder: Select difficulty (Easy/Medium/Hard)")
     print("  - Long press button (1 second): Start game")
@@ -981,30 +1238,47 @@ def main():
             if current_time - last_debug_time > 5.0:
                 print(f"[Status] Game state: {game.state}, "
                       f"Difficulty: {DIFFICULTY_NAMES[game.current_difficulty_index] if game.current_difficulty_index < len(DIFFICULTY_NAMES) else 'N/A'}, "
-                      f"Level: {game.current_level_index}")
+                      f"Apples sliced: {game.sliced_count}")
                 last_debug_time = current_time
             
             # Update game state
-            try:
-                game.update()
-            except Exception as e:
-                print(f"[Update] Error: {e}")
+            game.update()
             
-            # Redraw every 200ms
+            # Draw screen every 200ms to reduce flicker
             if current_time - last_draw_time > 0.2:
-                if display:
-                    try:
-                        game.draw()
-                        last_draw_time = current_time
-                    except:
-                        pass
+                try:
+                    game.draw()
+                    last_draw_time = current_time
+                except Exception as e:
+                    print(f"Draw error: {e}")
             
-            time.sleep(0.05)  # 20 FPS
-            
+            # Small delay to reduce CPU usage
+            time.sleep(0.05)
+    
     except KeyboardInterrupt:
-        print("\nGame exiting...")
+        print("\nGame exited by user")
     except Exception as e:
-        print(f"[Main Loop] Fatal error: {e}")
+        print(f"Fatal error in main loop: {e}")
+        # Cleanup
+        if display:
+            try:
+                display.fill(0)
+                display.show()
+            except:
+                pass
+        if pixels:
+            try:
+                pixels[0] = (0, 0, 0)
+            except:
+                pass
+        if buzzer:
+            try:
+                if BUZZER_INVERTED_LOGIC:
+                    buzzer.value = True
+                else:
+                    buzzer.value = False
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
